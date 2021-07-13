@@ -9,17 +9,23 @@ Following along from the tidymodels tutorial found [here](https://www.tidymodels
 # Load packages
 library(tidymodels)
 
-# Helper packages
+# Helper packages - part 1
 library(readr)
 library(rstanarm)
 library(broom.mixed)
 library(dotwhisker)
 
-# Load urchins dataset-adjust according to the tutorial 
+# Helper packages - part 2
+library(nycflights13)
+library(skimr)
+
+# Load urchins dataset-adjust according to the tutorial part 1
 urchins <- read_csv("https://tidymodels.org/start/models/urchins.csv") %>% 
   setNames(c("food_regime", "initial_volume", "width")) %>% 
   mutate(food_regime = factor(food_regime, levels = c("Initial", "Low", "High")))
 ```
+
+# Part 1 - Build and Fit Model
 
 Plot the data: 
 
@@ -35,7 +41,6 @@ ggplot(urchins,
   theme_bw()
 ```
 
-## Build and Fit a Model 
 
 ## Basic Model 
 
@@ -103,23 +108,20 @@ Bayesian analysis - requires prior distribution for each model parameter. Choosi
 prior_dist <- rstanarm::student_t(df = 1)
 
 # Make the parsnip model 
-bayes_mod <-   
-  linear_reg() %>% 
+bayes_mod <- linear_reg() %>% 
   set_engine("stan", 
              prior_intercept = prior_dist, 
              prior = prior_dist) 
 
 # Train the model - specify the functional form
-bayes_fit <- 
-  bayes_mod %>% 
+bayes_fit <- bayes_mod %>% 
   fit(width ~ initial_volume * food_regime, data = urchins)
 
 # Use tidy function to update the parameter table
 tidy(bayes_fit, conf.int = TRUE)
 
 # Predict the means and confidence interval with the new data
-bayes_plot_data <- 
-  new_points %>% 
+bayes_plot_data <- new_points %>% 
   bind_cols(predict(bayes_fit, new_data = new_points)) %>% 
   bind_cols(predict(bayes_fit, new_data = new_points, type = "conf_int"))
 
@@ -132,5 +134,154 @@ ggplot(bayes_plot_data, aes(x = food_regime)) +
   theme_bw()
 ```
 
-# Preprocessing Data
+# Part 2 - Preprocessing Data
+
+Preprocessing with `recipes` package. Recipes are built as a series of preprocessing steps, such as:   
+
+ - converting qualitative predictors to indicator variables (dummy variables)  
+ - transforming data to be on a different scale (e.g. log transformation)  
+ - transforming whole group predictors together  
+ - extracting key features from raw variables (e.g. day of the week from a date)   
+ 
+Using the NYC flights data from `nycflights13`. 
+
+```{r}
+# Setup the variables for the example 
+flight_data <- flights %>% 
+  mutate(
+    # Convert the arrival delay to a factor
+    arr_delay = ifelse(arr_delay >= 30, "late", "on_time"),
+    arr_delay = factor(arr_delay),
+    # We will use the date (not date-time) in the recipe below
+    date = as.Date(time_hour)
+  ) %>% 
+  # Include the weather data
+  inner_join(weather, by = c("origin", "time_hour")) %>% 
+  # Only retain the specific columns we will use
+  select(dep_time, flight, origin, dest, air_time, distance, 
+         carrier, date, arr_delay, time_hour) %>% 
+  # Exclude missing data
+  na.omit() %>% 
+  # For creating models, it is better to have qualitative columns
+  # encoded as factors (instead of character strings)
+  mutate_if(is.character, as.factor)
+
+# Glimpse the data using skimr 
+flight_data %>% 
+  skim(dest, carrier)
+```
+
+## Data Splitting 
+
+Split the data into testing and training data (randomly selected). Use a 75/25 split.  
+
+```{r}
+# Put 3/4 of the data into the training set 
+data_split <- initial_split(flight_data, prop = 3/4)
+
+# Create data frames for the two sets:
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+```
+
+## Create Recipe and Roles
+
+The `recipe` function has two arguments:  
+
+ - formula: any variable on the left-hand side of the `~` is a model outcome and the right-hand side are predictors   
+ - data: recipe is associated with the dataset (the training data) so `data = train_data`  
+
+Add `roles` to the recipe using `update_role()`. We want to retain the `flight` and `time_hour` fields as identifiers but not predictors adn we can reassign their roles using this function. 
+
+```{r}
+# Change the flight and time hour to an ID role
+flights_rec <- recipe(arr_delay ~ ., data = train_data) %>% 
+  update_role(flight, time_hour, new_role = "ID") 
+
+# Current set of variables and roles using the summary function 
+summary(flights_rec)
+```
+
+Add to the recipe using:   
+
+ - `step_date()`- create two new factor columns with the appropriate day of the week and month   
+ - `step_holiday()` - create binary variable indicating whether the current date is a holiday or not   
+ - `step_rm()`- remove the original `date` variable since we don't need it anymore  
+ - `step_dummy()` - create dummy variables; using `all_nominal()` selects all variables that are either factors or characters; using `-all_outcomes()` removes any outcome variables from this recipe step  
+    - Used together this creates dummy variables for all of the factor or character columns unless they are outcomes  
+ - `step_zv()` - removes columns from the data when the training set hae a single value so it's added to the recipe after `step_dummy()`  
+
+```{r}
+flights_rec <- recipe(arr_delay ~ ., data = train_data) %>% 
+  update_role(flight, time_hour, new_role = "ID") %>% 
+  step_date(date, features = c("dow", "month")) %>%               
+  step_holiday(date, holidays = timeDate::listHolidays("US")) %>% 
+  step_rm(date)  %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors())
+```
+
+## Fit a Model with a Recipe
+
+Steps:  
+
+ - Build the model 
+ - Process the recipe using the training set: involves any estimation or calculations based on the training set; in this case the training set is used to determine which predictors should be converted to dummy variables and which will have zero-variance in the training set   
+ - Apply the recipe to the training set: create the final predictor set on the training set   
+ - Apply the recipe to the test set: create the final predictor set on the test set  
+ 
+Using the `workflows` package from tidymodels simplifies this process by pairing the model and recipe together. 
+
+```{r}
+# Specify the model 
+lr_mod <- logistic_reg() %>% 
+  set_engine("glm")
+
+# Bundle the parsnip model (lr_mod) with the recipe (flights_rec)
+flights_wflow <- workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(flights_rec)
+
+# Fit the model - this object has the finalized recipe and fitted model objects 
+flights_fit <- flights_wflow %>% 
+  fit(data = train_data)
+
+# For example - pull the fitted model object 
+flights_fit %>% 
+  pull_workflow_fit() %>% 
+  tidy()
+```
+
+## Predict 
+
+Used the trained workflow (`flights_fit`) to predict the unseen test data 
+
+```{r}
+# Predict a class; late vs. on-time
+predict(flights_fit, test_data)
+
+# Predict a probability instead using type = 'prob'
+# Bind the output with some of the variables from test data 
+flights_pred <- predict(flights_fit, test_data, type = "prob") %>% 
+  bind_cols(test_data %>% select(arr_delay, time_hour, flight))
+```
+
+## Evaluate Workflow Performance
+
+Evaluate how well the model predicted late arrivals compared tothe true status of our outcome variable `arr_delay`. Try using the area under the curve `roc_curve()` and `roc_auc` from the `yardstick` package  
+
+```{r}
+# Graph the curve
+flights_pred %>% 
+  roc_curve(truth = arr_delay, .pred_late) %>% 
+  autoplot()
+
+# Calculate area under the curve 
+flights_pred %>% 
+  roc_auc(truth = arr_delay, .pred_late)
+```
+
+# Part 3 - Evaluate the Model with Resampling
+
+How to characterize the model performance based on resampling statistics  
 
