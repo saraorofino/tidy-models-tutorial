@@ -1,0 +1,136 @@
+---
+title: "tidymodels_practice"
+output: html_document
+---
+
+Following along from the tidymodels tutorial found [here](https://www.tidymodels.org/start/models/).  
+
+```{r setup}
+# Load packages
+library(tidymodels)
+
+# Helper packages
+library(readr)
+library(rstanarm)
+library(broom.mixed)
+library(dotwhisker)
+
+# Load urchins dataset-adjust according to the tutorial 
+urchins <- read_csv("https://tidymodels.org/start/models/urchins.csv") %>% 
+  setNames(c("food_regime", "initial_volume", "width")) %>% 
+  mutate(food_regime = factor(food_regime, levels = c("Initial", "Low", "High")))
+```
+
+Plot the data: 
+
+```{r}
+ggplot(urchins,
+       aes(x = initial_volume, 
+           y = width, 
+           group = food_regime, 
+           col = food_regime)) + 
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) +
+  scale_color_viridis_d(option = "plasma", end = .7) + 
+  theme_bw()
+```
+
+## Build and Fit a Model 
+
+## Basic Model 
+
+Regression model to predict width based on intial volume and feeding regime. In tidymodels use the `parsnip` package, linear regressions use the `linear_reg()` function and then you set the specific engine, or method for training the model, using the `set_engine()` call. The `fit()` function estimates or trains the model. Many models have `tidy()` call that provides summary results in useful formats (dataframe with standard column names):          
+
+```{r}
+# Specify the model using the linear_reg() call and then specify the engine using set_engine()
+# lm - linear model, ordinary least squares
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+# Fit the model using the functional form 
+lm_fit <- lm_model %>% 
+  fit(width ~ initial_volume * food_regime, data = urchins)
+lm_fit
+
+# Generate dot-and-whisker plot 
+tidy(lm_fit) %>% 
+  dwplot(dot_args = list(size=2, color='black'),
+         whisker_args = list(color = 'black'),
+         vline = geom_vline(xintercept = 0, color = 'grey', linetype = 2))
+```
+
+Arguments for dwplot - `ci` confidence interval; if you use `dwplot(list())` you can have multiple model lines show up at one time  
+
+## Making Predictions
+
+Predict the mean body size of urchins with an initial volume of 20 ml at the three different food regimes, using the `predict()` function and the linear model we created     
+
+```{r}
+# Generate the new data 
+new_points <- expand.grid(initial_volume = 20,
+                          food_regime = c("Initial", "Low", "High"))
+
+# Predict mean body weight - output is a tibble
+mean_pred <- predict(lm_fit, 
+                     new_data = new_points)
+
+# Predict the confidence internval
+ci_pred <- predict(lm_fit,
+                   new_data = new_points,
+                   type = "conf_int")
+
+# Combine the new means and ci 
+plot_data <- new_points %>% 
+  bind_cols(mean_pred) %>% 
+  bind_cols(ci_pred)
+
+# Plot 
+ggplot(plot_data, aes(x = food_regime)) + 
+  geom_point(aes(y = .pred)) + 
+  geom_errorbar(aes(ymin = .pred_lower, 
+                    ymax = .pred_upper),
+                width = .2) + 
+  labs(y = "urchin size") + 
+  theme_bw()
+```
+
+## New Model 
+
+Bayesian analysis - requires prior distribution for each model parameter. Choosing a wide, bell-shaped Cauchy distribution. Function arguments requires `prior` and `prior_intercept` arguments and there is a `stan` engine that can be callled using `parsnip::set_engine()`  
+
+```{r}
+# set the prior distribution
+prior_dist <- rstanarm::student_t(df = 1)
+
+# Make the parsnip model 
+bayes_mod <-   
+  linear_reg() %>% 
+  set_engine("stan", 
+             prior_intercept = prior_dist, 
+             prior = prior_dist) 
+
+# Train the model - specify the functional form
+bayes_fit <- 
+  bayes_mod %>% 
+  fit(width ~ initial_volume * food_regime, data = urchins)
+
+# Use tidy function to update the parameter table
+tidy(bayes_fit, conf.int = TRUE)
+
+# Predict the means and confidence interval with the new data
+bayes_plot_data <- 
+  new_points %>% 
+  bind_cols(predict(bayes_fit, new_data = new_points)) %>% 
+  bind_cols(predict(bayes_fit, new_data = new_points, type = "conf_int"))
+
+# Plot 
+ggplot(bayes_plot_data, aes(x = food_regime)) + 
+  geom_point(aes(y = .pred)) + 
+  geom_errorbar(aes(ymin = .pred_lower, ymax = .pred_upper), width = .2) + 
+  labs(y = "urchin size") + 
+  ggtitle("Bayesian model with t(1) prior distribution") + 
+  theme_bw()
+```
+
+# Preprocessing Data
+
