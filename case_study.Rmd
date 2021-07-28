@@ -1,0 +1,247 @@
+---
+title: "case_study"
+output: html_document
+---
+
+Following along from the tidymodels final case study [here](https://www.tidymodels.org/start/case-study/)  
+
+Goal: build a model to predict which hotel stays included children and/or babies adn which did not. The outcome variable `children` is a factor with two levels `children` and `none`.    
+
+# Setup 
+
+```{r setup}
+library(tidymodels)  
+
+# Helper packages
+library(readr)
+library(ranger)
+library(glmnet)
+library(vip)
+library(parallel)
+
+# Data 
+hotels <- read_csv('https://tidymodels.org/start/case-study/hotels.csv') %>%
+  mutate_if(is.character, as.factor) 
+
+# Check proportion of outcome variable
+hotels %>% 
+  count(children) %>% 
+  mutate(prop = n/sum(n)) 
+```
+
+# Data Splitting and Resampling
+
+The outcome variable `children` is pretty unbalanced, more than 90% of the stays don't include children. In creating the training/testing datasets we'll use stratified random sampling and reserve 25% of the data for testing. Instead of creating 10 resamples of the training set, we'll create a single resample called a validation set. This will split the `hotels_other` dataset and create two new datasets: the validation set (20% of the data) and the training set (80% of the data). The model metrics are computed on the 20% of the data in the validation set, which should be large enough in this case to provide a reliable indicator for how well each model predicts the outcome with a single iteration of resampling.  
+
+```{r}
+set.seed(123)
+# Stratify the initial data
+splits <- initial_split(hotels, strata = children)
+
+# Training and testing data 
+hotel_other <- training(splits)
+hotel_test  <- testing(splits)
+
+set.seed(234)
+# Validation set 
+val_set <- validation_split(hotel_other,
+                            strata = children,
+                            prop = 0.8)
+```
+
+# Build the Models
+
+Model 1: Penalized logistic regression
+
+Using the `glmnet` package in R to fit a generalized linear model via penalized maximum likelihood. This method of estimating the logistic regression slope parameters uses a penalty on the process so less relevant predictors are driven toward a value of zero. Setting `mixture` to 1 means the glmnet model will potentially remove irrelevant predictors and choose a simpler model.    
+
+Model 2: Tree-based ensemble 
+
+Using random forest with the `ranger` package. Each tree is non-linear and aggregating across trees makes random forests also non-linear but more robust and stable compared to individual trees. In this model we'll tune the `mtry` (number of predictor variables in each node in the decision tree) and `min_n` (minimum n to split at any node) argument values. A note, random forests can be computationally expensive and using parallized processing can improve training time. The `tune` package can do parallel processing and that should generally be used, especially if using 10-fold cross-validation. In this example we have a single validation set so using parallelization in `tune` isn't an option. Instead we can use the `num.threads` argument in the `ranger` package as a built in way to parallel process, but this is not recommended if it's possible to do it using `tune`.  
+
+```{r}
+# Model 1 
+lr_mod <- logistic_reg(penalty = tune(),
+                       mixture = 1) %>% 
+  set_engine("glmnet")
+
+# Model 2
+cores <- parallel::detectCores()
+
+rf_mod <- rand_forest(mtry = tune(),
+                      min_n = tune(),
+                      trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+```
+
+# Create Recipes / Workflows
+
+Model 1
+
+Preprocessing of data should be done when using linear models. The recipe will make the following changes:  
+ - Create predictors for year, month, and day of the week using `step_date`  
+ - Generate a set of indicator variables for specific holidays using `step_holiday`  
+ - Remove the original date variable since we have more specific date indicators using `step_rm`  
+ - Convert all characters or factors into one or more numeric binary model terms using `step_dummy`  
+ - Remove indicators that only contain a single unique value (e.g. all zeros) using `step_zv`  
+ - Center and scale numeric variables using `step_normalize`  
+ 
+Model 2  
+
+Random forest does not require dummy or normalized predictor varaibles, but we still want to make a few changes:  
+ - Create predictors for year, month, and day of the week using `step_date`  
+ - Generate a set of indicator variables for specific holidays using `step_holiday`  
+ - Remove the original date variable since we have more specific date indicators using `step_rm`  
+ 
+ 
+```{r}
+holidays <- c("AllSouls", "AshWednesday", "ChristmasEve", "Easter", 
+              "ChristmasDay", "GoodFriday", "NewYearsDay", "PalmSunday")
+
+# Model 1 
+## Recipe
+lr_recipe <- recipe(children ~ ., data = hotel_other) %>% 
+  step_date(arrival_date) %>% 
+  step_holiday(arrival_date, holidays = holidays) %>% 
+  step_rm(arrival_date) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+## Workflow
+lr_workflow <- workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_recipe)
+
+# Model 2 
+## Recipe
+rf_recipe <- recipe(children ~ ., data = hotel_other) %>% 
+  step_date(arrival_date) %>% 
+  step_holiday(arrival_date) %>% 
+  step_rm(arrival_date)
+
+## Workflow
+rf_workflow <- workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_recipe(rf_recipe)
+```
+
+# Train and Tune Models
+
+Model 1: Setup a grid of `penalty` values (0.01 to 0.0001) to tune the model. Tune the model using `tune_grid` to train the 30 penalized logistic regression models and save the validation set predictions (using the `control_grid` argument) so diagnostic information can be available after the model fit. Visualize the validation metrics by plotting the area under the ROC curve against the range of penalty values to select the best one. 
+
+The best model is going to have the highest penalty (least predictors) without losing model performance. Many of the penalty values have similarly high performances so we are going to choose the highest of these penalty values since that should lead to the model with the least predictors. The best model we're selecting uses a penalty of 0.00137 and is shown by the red line in the graph.  
+
+Model 2: Since `mtry` depends on the number of predictors in the set, `tune_grid` determines the upper bound once it receives the data. By specifying `grid=25` we are telling it to tune using 25 candidate models.   
+
+We can see this model performs better than the best linear model. Plotting the results of the tuning shows that both `mtry` and `min_n` should be fairly small to optimize performance. Given the narrow range of values on the y axis the model performance is robust to the choice of these parameter values. We'll just select the best model based on the ROC AUC metric.  
+
+```{r}
+# Model 1
+## Create tuning grid
+lr_reg_grid <- tibble(penalty = 10^seq(-4,-1, length.out = 30))
+
+## Tune model 
+lr_res <- lr_workflow %>% 
+  tune_grid(val_set,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+## Visualize 
+lr_plot <- lr_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + 
+  geom_line() + 
+  geom_vline(xintercept = 0.00137, color = 'red') + 
+  ylab("Area under the ROC Curve") +
+  scale_x_log10(labels = scales::label_number())
+
+lr_plot
+
+## Select best
+lr_best <- lr_res %>% 
+  collect_metrics() %>% 
+  arrange(penalty) %>% 
+  slice(12)
+
+## Autoplot sensitivity for best model 
+lr_auc <- lr_res %>% 
+  collect_predictions(parameters = lr_best) %>% 
+  roc_curve(children, .pred_children) %>% 
+  mutate(model = "Logistic Regression")
+autoplot(lr_auc)
+
+# Model 2
+set.seed(345)
+
+## Tune model
+rf_res <- rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+## Visualize
+autoplot(rf_res)
+
+## Select best
+rf_best <- rf_res %>% 
+  select_best(metric = 'roc_auc')
+
+## Autoplot sensitivity for best model 
+rf_auc <- rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(children, .pred_children) %>% 
+  mutate(model = 'Random Forest')
+
+# Compare the validation set of ROC curves for top logisitic and RF model 
+bind_rows(rf_auc, lr_auc) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+We can see the random forest is uniformally better across probability thresholds. This is the model we will use to do the final steps and make predictions.  
+
+# Final Model 
+
+Fit the final model on all rows of data not originally held out for testing (both the training and validation sets combined or the `splits` dataframe) and then evaluate performance.  
+
+We need to build our model again from scratch taking the best hyperparameter values from the validation set (find them in `rf_best`). When we set the engine we are adding an argument, `importance = impurity` to provide variable importance scores for the last model.  
+
+```{r}
+# Finalized model 
+last_rf_model <- rand_forest(mtry = 4, min_n = 5, trees = 1000) %>% 
+  set_engine("ranger", num.threads = cores, importance = 'impurity') %>% 
+  set_mode("classification")
+
+# Finailzed workflow - just update the model 
+last_rf_workflow <- rf_workflow %>% 
+  update_model(last_rf_model)
+
+# The finalized fit 
+set.seed(345)
+last_rf_fit <- last_rf_workflow %>% 
+  last_fit(splits)
+```
+
+The ROC AUC value is pretty close to what we got when we tuend the random forest model with the validation set (this is good). We can access the variable importance scores via the .workflow column. The `vip` package helps to visualize the variable importance for the top 20 features.  Visualize the final ROC curve for predicting the children factor `children`, we need to provide the relevant class probability which is `.pred_children` (as opposed to `.pred_none`).  
+
+```{r}
+last_rf_fit %>% 
+  pluck(".workflow", 1) %>%  # Get first column from .workflow
+  pull_workflow_fit() %>%  # Get the importance metric 
+  vip(num_features = 20)
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(children, .pred_children) %>% 
+  autoplot()
+```
+
+Based on the results, the validation set and the test set performance statistics are very close so we would have high confidence that our random forest model with selected hyperparamters would perform well when predicting new data.  
