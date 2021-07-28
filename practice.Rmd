@@ -19,10 +19,21 @@ library(dotwhisker)
 library(nycflights13)
 library(skimr)
 
-# Load urchins dataset-adjust according to the tutorial part 1
+# Helper packages - part 3
+library(modeldata)
+library(ranger)
+
+# Helper packages - part 4
+library(vip)
+library(rpart)
+
+# Load urchins dataset - part 1
 urchins <- read_csv("https://tidymodels.org/start/models/urchins.csv") %>% 
   setNames(c("food_regime", "initial_volume", "width")) %>% 
   mutate(food_regime = factor(food_regime, levels = c("Initial", "Low", "High")))
+
+# Load cells dataset - part 3
+data(cells, package='modeldata')
 ```
 
 # Part 1 - Build and Fit Model
@@ -268,7 +279,7 @@ flights_pred <- predict(flights_fit, test_data, type = "prob") %>%
 
 ## Evaluate Workflow Performance
 
-Evaluate how well the model predicted late arrivals compared tothe true status of our outcome variable `arr_delay`. Try using the area under the curve `roc_curve()` and `roc_auc` from the `yardstick` package  
+Evaluate how well the model predicted late arrivals compared to the true status of our outcome variable `arr_delay`. Try using the area under the curve `roc_curve()` and `roc_auc` from the `yardstick` package  
 
 ```{r}
 # Graph the curve
@@ -284,4 +295,210 @@ flights_pred %>%
 # Part 3 - Evaluate the Model with Resampling
 
 How to characterize the model performance based on resampling statistics  
+
+## Split Data 
+
+The cells data includes 2 strata of the `class` variable, `ps` and `ws` which are disproportional in the data (~64% ps and ~36% ws). Since we want an even proprortion in the testing and training data we can use the `rsample::initial_split()` with the `strata` argument.  
+
+```{r}
+set.seed(123) #For reproducibility 
+
+# Indicate the relative proprortion of each strata in raw data 
+cell_split <- initial_split(cells %>% select(-case), 
+                            strata = class)
+
+# Create testing/training data 
+cell_train <- training(cell_split)
+cell_test  <- testing(cell_split)
+```
+
+## Model with RF
+
+Random forest models tend to require less preprocessing of data and default parameters tend to give reasonable results. For that reason, we don't need a `recipe` for the cells data. However, it might be helpful to have a recipe if you want to keep identifier columns that are not part of the equation (like a vessel identity in GFW?)   
+
+To fit a random forest model on the training set, use the `parsnip` package with the `ranger` engine. The `ranger` engine is just a way to actually implement the random forest model.
+
+```{r}
+# Define the model 
+rf_mod <- rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+# Set seed before fitting (different numbers than above)
+set.seed(234)
+
+# Want to predict the class (categorical variable)
+rf_fit <- rf_mod %>% 
+  fit(class ~ ., data = cell_train)
+```
+
+## Resampling
+
+Resampling methods like cross-validation and bootstrapping can create a series of data sets similar to the training dataset to determine model performance. We'll use 10-fold cross-validation to create 10 roughly equal 'folds'. In the first model run the first fold will be held out for assessing model performance and the remaining 90% of the data will be used to train the model. This process repeats iteratively holding out each fold for assessment. This creates 10 sets of performance metrics and we average those to get the results.  Can use either a resample model specification preprocessed with a formula or `recipe`, or resample a `workflow` that bundles together the model and the formula/recipe. This example uses a `workflow`.  
+
+```{r}
+# Create a resampling object
+set.seed(345)
+folds <- vfold_cv(cell_train, v=10)
+
+# Create a workflow
+rf_wk <- workflow() %>% 
+  add_model(rf_mod) %>% 
+  add_formula(class ~ .)
+
+set.seed(456)
+rf_fit_rs <- rf_wk %>% 
+  fit_resamples(folds)
+
+# Extract performance using the tune package
+collect_metrics(rf_fit_rs)
+```
+
+## Test Performance
+
+Return to the test set to estimate final model performance. 
+
+```{r}
+# Test set predictions
+rf_testing_pred <- predict(rf_fit, cell_test) %>% 
+  bind_cols(predict(rf_fit, cell_test, type = "prob")) %>% 
+  bind_cols(cell_test %>% select(class))
+
+# Accuracy measures of predictions 
+rf_testing_pred %>% 
+  roc_auc(truth = class, .pred_PS)
+
+rf_testing_pred %>% 
+  accuracy(truth = class, .pred_class)
+```
+
+# Part 4 - Tune Model Parameters
+
+Hyperparameters are model parameters that can't be learned directly from a data set during model training. Some examples include the number of predictors that are sampled at splits in a tree-based model (`mtry`) or learning rate in a boosted tree model (`learn_rate`). Instead of learning these hyperparameters during model training, we can estimate the best values for these by training many models on resampled data sets and exploring how well the models perform. This process is called `tuning`.  
+
+In this example, we'll train a decision tree model and explore tuning of two hyperparameters: `cost_complexity` and the maximum `tree_depth`. The `cost_complexity` helps by pruning back the tree. It adds a cost, or penalty, to error rates of more complex trees; a cost closer to zero decreases the number of tree nodes pruned and is more likely to result in an overfit tree. Tuning `tree_depth` on the other hand, helps by stopping the tree from growing after it reaches a certain depth. We want to tune these hyperparamters to find what those two values shoudl be for our model to do the best job predicting image segmentation.  
+
+## Split Data
+
+Still need to split the training and testing data and as before we can use `strata = class` to create the split using stratified sampling so both have the same proportions of both kinds of segments. 
+
+```{r}
+# Split the data 
+set.seed(123)
+cell_split <- initial_split(cells %>% select(-case), 
+                            strata = class)
+
+# Designate trainiing and testing 
+cell_train <- training(cell_split)
+cell_test  <- testing(cell_split)
+```
+
+## Model 
+
+Use a `decision_tree` model with the `rpart` engine. To tune the decision tree hyperparameters `cost_complexity` and `tree_depth` we create a model specification that identifies which hyperparameters we plan to tune. Using `grid_regular` chooses sensible values to try for each hyperparameter we want to choose, the `levels` argument dictates how many values we want for each hyperparameter. 
+
+```{r}
+# Specify parameters to tune 
+tune_spec <- decision_tree(cost_complexity = tune(),
+                           tree_depth = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+# Create a grid of values to try 
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = 5)
+
+# Cross validation folds
+set.seed(234)
+cell_folds <- vfold_cv(cell_train)
+```
+
+## Tune Model 
+
+Use `tune_grid` to fit models at all the different values we chose for each tuned hyperparameters. There are several options for building the object for tuning:  
+
+ - Tune a model specification along with a recipe or model   
+ - Tune a workflow that bundles together a model specification and a model recipe  
+ 
+Here we use `workflow` with a straightforward formula, if the model involved more complex preprocessing we could use `add_recipe` instead of `add_formula`  
+
+```{r}
+set.seed(345)
+
+# Create workflow
+tree_wf <- workflow() %>%
+  add_model(tune_spec) %>%
+  add_formula(class ~ .)
+
+# Run model 
+tree_res <- tree_wf %>% 
+  tune_grid(
+    resamples = cell_folds,
+    grid = tree_grid
+    )
+```
+
+Explore the results through visualization and then select the best result. The function `collect_metrics` gives us the results in tidy format. There were 25 candidate models (from the 25 different tuning parameter values) and two metrics, `accuracy` and `roc_auc` and we get a row for each metric and model. 
+
+```{r}
+# Graph the results
+tree_res %>% 
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+The best tree seems to be between the values with a tree depth of 4. The `show_best` function shows the top 5 candidate models and we can also use the `select_best` function will pull out the single set of hyperparameter values for our decision tree model.  
+
+```{r}
+# Select the best hyperparameter values
+best_tree <- tree_res %>% 
+  select_best('roc_auc')
+```
+
+## Finalize the Model
+
+We can update our workflow object `tree_wf` with the values from `select_best`  
+
+```{r}
+final_wf <- tree_wf %>% 
+  finalize_workflow(best_tree)
+
+# Fit the final model to the training data 
+final_tree <- final_wf %>% 
+  fit(data = cell_train)
+```
+
+We can use the `vip` package to estimate variable importance. Can extract the model object from the workflow using `pull_workflow_fit`    
+
+```{r}
+final_tree %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+## Predict 
+
+Estimate model performace using the function `last_fit`, this function fits the finalized model on the full training data set and evaluates the finalized model on the testing data  
+
+```{r}
+# Final fit 
+final_fit <- final_wf %>% 
+  last_fit(cell_split)
+
+final_fit %>% 
+  collect_metrics()
+
+# Predict and test autoplot
+final_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(class, .pred_PS) %>% 
+  autoplot()
+```
 
